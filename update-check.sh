@@ -1,41 +1,46 @@
 #!/usr/bin/env bash
-# update-check.sh – werkt de server bij en meldt daarna JA of NEE
+# update-check.sh – werkt een Linux-server volledig bij en meldt daarna JA of NEE
 #
-# Gebruik (rechtstreeks van GitHub):
-#   curl -fsSL https://raw.githubusercontent.com/Rob-for/202610-update-check-php/main/update-check.sh | sudo bash
-# of lokaal:
-#   sudo bash update-check.sh
+# Eerste keer (Pushover-sleutels worden onthouden in /etc/update-check.conf):
+#   curl -fsSL https://raw.githubusercontent.com/Rob-for/202610-update-check-php/main/update-check.sh | PUSHOVER_USER=xxx PUSHOVER_TOKEN=yyy bash
+# Daarna is dit genoeg:
+#   curl -fsSL https://raw.githubusercontent.com/Rob-for/202610-update-check-php/main/update-check.sh | bash
+# (Geen root? Zet 'sudo' voor 'PUSHOVER_USER=...' of voor 'bash'.)
 #
-# Logbestand: /var/log/update-check.log
 # Werkt op Debian/Ubuntu (apt) en Fedora/RHEL/Rocky/Alma (dnf).
-#
 # Exitcodes: 0 = JA, 2 = JA met aandachtspunten, 1 = NEE
 
 # Alles zit in main(), zodat bash het hele script eerst inleest.
-# Zo kan 'curl ... | sudo bash' veilig: apt/dpkg kunnen het script niet van stdin 'opeten'.
+# Zo is 'curl ... | bash' veilig: apt/dpkg kunnen het script niet van stdin 'opeten'.
 main() {
 set -u
 
 if [ "$(id -u)" -ne 0 ]; then
-  echo "Start dit script als root (met sudo)."
+  echo "Start dit script als root (of met sudo)."
   exit 1
 fi
-
 exec </dev/null
 
 LOG=/var/log/update-check.log
-
-# Instellingen per server (mail e.d.) – staan NIET in de publieke repo
 CONF=/etc/update-check.conf
+
+# Pushover-instellingen: meegegeven waarden gaan voor en worden onthouden
+NIEUW_USER=${PUSHOVER_USER:-}; NIEUW_TOKEN=${PUSHOVER_TOKEN:-}; NIEUW_PRIO=${PUSHOVER_PRIORITY:-}
 # shellcheck source=/dev/null
 [ -f "$CONF" ] && . "$CONF"
+[ -n "$NIEUW_USER" ]  && PUSHOVER_USER=$NIEUW_USER
+[ -n "$NIEUW_TOKEN" ] && PUSHOVER_TOKEN=$NIEUW_TOKEN
+[ -n "$NIEUW_PRIO" ]  && PUSHOVER_PRIORITY=$NIEUW_PRIO
+PUSHOVER_PRIORITY=${PUSHOVER_PRIORITY:--1}
+if [ -n "$NIEUW_USER$NIEUW_TOKEN$NIEUW_PRIO" ]; then
+  ( umask 077
+    printf 'PUSHOVER_USER=%q\nPUSHOVER_TOKEN=%q\nPUSHOVER_PRIORITY=%q\n' \
+      "${PUSHOVER_USER:-}" "${PUSHOVER_TOKEN:-}" "$PUSHOVER_PRIORITY" > "$CONF" )
+fi
 
-RUNLOG=$(mktemp)
-exec > >(tee -a "$LOG" "$RUNLOG") 2>&1
+exec > >(tee -a "$LOG") 2>&1
 
-PROBLEMEN=()
-WAARSCHUWINGEN=()
-INFO=()
+PROBLEMEN=(); WAARSCHUWINGEN=(); INFO=()
 probleem()     { PROBLEMEN+=("$1"); }
 waarschuwing() { WAARSCHUWINGEN+=("$1"); }
 
@@ -48,11 +53,17 @@ echo "=== update-check $(date '+%F %T') op $(hostname) ==="
 if command -v apt-get >/dev/null; then
   PM=apt
   export DEBIAN_FRONTEND=noninteractive
+  export NEEDRESTART_SUSPEND=1          # needrestart pas na de updates zelf draaien
   # Bij gewijzigde configbestanden: jouw versie behouden
   APT_OPTS=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
 
   echo ">> Pakketlijsten ophalen..."
   apt-get update || probleem "apt-get update mislukt (netwerk- of repository-fout)"
+
+  if ! dpkg -s needrestart >/dev/null 2>&1; then
+    echo ">> needrestart installeren (herstart diensten na updates)..."
+    apt-get "${APT_OPTS[@]}" install needrestart || waarschuwing "needrestart installeren mislukt"
+  fi
 
   echo ">> Pakketten bijwerken..."
   apt-get "${APT_OPTS[@]}" upgrade --with-new-pkgs || probleem "apt-get upgrade mislukt"
@@ -62,6 +73,7 @@ elif command -v dnf >/dev/null; then
   echo ">> Pakketten bijwerken..."
   dnf -y upgrade --refresh || probleem "dnf upgrade mislukt"
   dnf -y autoremove || waarschuwing "autoremove mislukt"
+  dnf -q needs-restarting -r >/dev/null 2>&1; [ $? -gt 1 ] && dnf -y install dnf-plugins-core >/dev/null 2>&1
 else
   echo "Geen apt of dnf gevonden; deze distributie wordt niet ondersteund."
   exit 1
@@ -72,7 +84,6 @@ fi
 # ---------------------------------------------------------------
 echo ">> Controleren op achtergebleven updates..."
 if [ "$PM" = apt ]; then
-  # Simuleer nog een upgrade om te zien wat er (nog) openstaat
   SIM=$(LC_ALL=C apt-get -s upgrade --with-new-pkgs 2>/dev/null)
   blok() { echo "$SIM" | awk -v kop="$1" '$0 ~ kop {f=1; next} f && /^  / {print; next} {f=0}' | xargs; }
   OPEN=$(echo "$SIM" | grep -c '^Inst ' || true)
@@ -85,170 +96,53 @@ if [ "$PM" = apt ]; then
     KEPT_ECHT=$(for k in $KEPT; do echo " $HELD " | grep -q " $k " || echo "$k"; done | xargs)
     [ -n "$KEPT_ECHT" ] && probleem "Tegengehouden door afhankelijkheden (los op met: apt full-upgrade): $KEPT_ECHT"
   fi
-  [ -n "$HELD" ] && waarschuwing "Bewust vastgehouden met apt-mark hold, niet bijgewerkt: $HELD"
+  [ -n "$HELD" ] && waarschuwing "Bewust vastgehouden (apt-mark hold): $HELD"
   [ -n "$FASE" ] && INFO+=("Uitgesteld door Ubuntu phased updates (normaal, volgt vanzelf): $FASE")
-  if [ -n "$(dpkg --audit 2>/dev/null)" ]; then
-    probleem "dpkg meldt half-geïnstalleerde pakketten (oplossen met: dpkg --configure -a)"
-  fi
-  if [ -f /var/run/reboot-required ]; then
-    waarschuwing "Herstart nodig voor: $(cat /var/run/reboot-required.pkgs 2>/dev/null | sort -u | tr '\n' ' ')"
-  fi
+  [ -n "$(dpkg --audit 2>/dev/null)" ] && probleem "Half-geïnstalleerde pakketten (oplossen met: dpkg --configure -a)"
 else
   dnf -q check-update >/dev/null 2>&1
   [ $? -eq 100 ] && probleem "Er staan nog updates open (zie: dnf check-update)"
-  if command -v needs-restarting >/dev/null; then
-    needs-restarting -r >/dev/null 2>&1 || waarschuwing "Herstart nodig (nieuwe kernel of systeembibliotheken)"
-  fi
 fi
 
 # ---------------------------------------------------------------
-# 3. PHP-versies controleren
+# 3. Diensten herstarten die nog oude (kwetsbare) code in het geheugen hebben
 # ---------------------------------------------------------------
-# Einde beveiligingsupdates per versie (bron: php.net/supported-versions).
-# Werk deze lijst af en toe bij als er nieuwe versies uitkomen.
-php_eol() {
-  case "$1" in
-    8.2) echo 2026-12-31 ;;
-    8.3) echo 2027-12-31 ;;
-    8.4) echo 2028-12-31 ;;
-    8.5) echo 2029-12-31 ;;
-    [0-7].*|8.0|8.1) echo verlopen ;;
-    *) echo onbekend ;;
-  esac
-}
-
-check_php() {
-  local v="$1" waar="$2" eol dagen
-  eol=$(php_eol "$v")
-  case "$eol" in
-    verlopen) probleem "PHP $v ($waar) krijgt geen beveiligingsupdates meer – upgraden" ;;
-    onbekend) echo "   PHP $v ($waar): nieuwer dan dit script kent, vermoedelijk ok" ;;
-    *)
-      dagen=$(( ( $(date -d "$eol" +%s) - $(date +%s) ) / 86400 ))
-      if [ "$dagen" -lt 0 ]; then
-        probleem "PHP $v ($waar) is sinds $eol einde levensduur – upgraden"
-      elif [ "$dagen" -lt 120 ]; then
-        waarschuwing "PHP $v ($waar) stopt over $dagen dagen met updates ($eol) – upgrade plannen"
-      else
-        echo "   PHP $v ($waar): ondersteund tot $eol"
-      fi ;;
-  esac
-}
-
-# PHP2Shell (CVE-2026-109618 / CVE-2026-109619, oktober 2026)
-# Eerste upstream-versies MET de fix. Verwacht per 21-10-2026 16:00 –
-# controleer na de release op https://www.php.net/archive/2026.php
-PHP2SHELL_CVE='CVE-2026-10961[89]'
-php2shell_fix() {
-  case "$1" in
-    8.2) echo 8.2.35 ;;
-    8.3) echo 8.3.36 ;;
-    8.4) echo 8.4.27 ;;
-    8.5) echo 8.5.12 ;;
-    *)   echo geen ;;
-  esac
-}
-versie_ge() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$2" ]; }  # $1 >= $2
-
-# $1 = volledige versie (8.2.32), $2 = waar, $3 = "ja" als de distro-changelog de CVE noemt
-check_php2shell() {
-  local full="$1" waar="$2" backport="${3:-nee}" fix
-  fix=$(php2shell_fix "${full%.*}")
-  if [ "$backport" = ja ]; then
-    echo "   PHP2Shell: PHP $full ($waar) gepatcht (distro-update)"
-  elif [ "$fix" != geen ] && versie_ge "$full" "$fix"; then
-    echo "   PHP2Shell: PHP $full ($waar) gepatcht"
-  elif [ "$fix" = geen ]; then
-    probleem "PHP2Shell: PHP $full ($waar) is KWETSBAAR en krijgt geen upstream-fix – upgraden of offline halen"
-  else
-    probleem "PHP2Shell: PHP $full ($waar) is KWETSBAAR – fix zit in $fix of een distro-update"
-  fi
-}
-
-echo ">> PHP controleren..."
-PHP_GEVONDEN=0
-PHP_VERSIES=$(
-  {
-    if command -v php >/dev/null; then
-      php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION, "\n";' 2>/dev/null
-    fi
-    if [ "$PM" = apt ]; then
-      # Alle geïnstalleerde PHP-versies (ook php-fpm die de webserver gebruikt)
-      dpkg-query -W -f='${Status} ${Package}\n' 'php*' 2>/dev/null \
-        | awk '/install ok installed/ && $4 ~ /^php[0-9]+\.[0-9]+(-|$)/ {sub(/^php/,"",$4); sub(/-.*/,"",$4); print $4}'
-    fi
-  } | sort -u | xargs
-)
-
-for v in $PHP_VERSIES; do
-  PHP_GEVONDEN=1
-  check_php "$v" "server"
-
-  # PHP2Shell: kijk eerst of de distro de fix heeft (changelog), anders naar het versienummer
-  full=""; backport=nee
-  if [ "$PM" = apt ]; then
-    pkgv=$(dpkg-query -W -f='${Version}' "php$v-common" 2>/dev/null)
-    full=$(echo "$pkgv" | sed -E 's/^[0-9]+://; s/[-+~].*//')
-    cl="/usr/share/doc/php$v-common/changelog.Debian.gz"
-    [ -f "$cl" ] && zgrep -qE "$PHP2SHELL_CVE" "$cl" && backport=ja
-  else
-    full=$(php -r 'echo PHP_VERSION;' 2>/dev/null)
-    rpm -q --changelog php-common 2>/dev/null | grep -qE "$PHP2SHELL_CVE" && backport=ja
-  fi
-  [ -n "$full" ] || full=$(php -r 'echo PHP_VERSION;' 2>/dev/null)
-  [ -n "$full" ] && check_php2shell "$full" "server" "$backport"
-done
-
-# PHP in draaiende Docker-containers (officiële images volgen upstream-versies)
-if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
-  for c in $(docker ps --format '{{.Names}}'); do
-    full=$(docker exec "$c" php -r 'echo PHP_VERSION;' 2>/dev/null) || continue
-    [ -n "$full" ] || continue
-    PHP_GEVONDEN=1
-    v=$(echo "$full" | cut -d. -f1,2)
-    check_php "$v" "container $c"
-    check_php2shell "$(echo "$full" | sed -E 's/[-+~].*//')" "container $c"
+echo ">> Diensten met oude bibliotheken herstarten..."
+REBOOT=0
+if [ "$PM" = apt ] && command -v needrestart >/dev/null; then
+  needrestart -r a -q >/dev/null 2>&1
+  NR=$(needrestart -b -r l 2>/dev/null)
+  KSTA=$(echo "$NR" | awk -F': ' '/NEEDRESTART-KSTA/ {print $2}')
+  REST=$(echo "$NR" | awk -F': ' '/NEEDRESTART-SVC/ {print $2}' | xargs)
+  [ "${KSTA:-0}" -ge 2 ] && REBOOT=1
+  [ -n "$REST" ] && waarschuwing "Niet automatisch herstart (herstart van de server lost dit op): $REST"
+elif [ "$PM" = dnf ]; then
+  for svc in $(dnf -q needs-restarting -s 2>/dev/null); do
+    case "$svc" in
+      dbus*|systemd-*|*getty*|user@*) ;;   # niet veilig om live te herstarten
+      *) systemctl try-restart "$svc" && echo "   herstart: $svc" ;;
+    esac
   done
-  DOCKER_INFO=1
-else
-  DOCKER_INFO=0
+  dnf -q needs-restarting -r >/dev/null 2>&1; [ $? -eq 1 ] && REBOOT=1
+  REST=$(dnf -q needs-restarting -s 2>/dev/null | xargs)
+  [ -n "$REST" ] && waarschuwing "Niet automatisch herstart (herstart van de server lost dit op): $REST"
 fi
-[ "$PHP_GEVONDEN" -eq 0 ] && echo "   Geen PHP gevonden."
-
-# Draaien PHP-FPM / Apache nog met oude PHP in het geheugen? Dan herstarten.
-if [ "$PHP_GEVONDEN" -eq 1 ] && [ "${HERSTART_PHP:-ja}" = ja ]; then
-  NIEUWSTE=$(stat -c %Y /usr/sbin/php-fpm* /usr/bin/php[0-9]* /usr/lib/php/*/*.so \
-    /usr/lib/apache2/modules/libphp*.so /usr/lib64/httpd/modules/libphp*.so /usr/lib64/php/modules/*.so \
-    2>/dev/null | sort -n | tail -1)
-  if [ -n "$NIEUWSTE" ]; then
-    for svc in $(systemctl list-units --type=service --state=running --no-legend --plain \
-                  'php*-fpm*' 'apache2*' 'httpd*' 2>/dev/null | awk '{print $1}'); do
-      gestart=$(systemctl show -p ExecMainStartTimestamp --value "$svc" 2>/dev/null)
-      gestart=$(date -d "$gestart" +%s 2>/dev/null || echo 0)
-      if [ "$gestart" -lt "$NIEUWSTE" ]; then
-        echo "   $svc draait nog met oude PHP – herstarten..."
-        systemctl try-restart "$svc" && echo "   $svc herstart" \
-          || probleem "$svc kon niet herstart worden – draait mogelijk nog kwetsbare PHP"
-      fi
-    done
-  fi
-fi
+[ -f /var/run/reboot-required ] && REBOOT=1
+[ "$REBOOT" -eq 1 ] && waarschuwing "Herstart van de server nodig (nieuwe kernel of systeembibliotheken)"
 
 # ---------------------------------------------------------------
 # 4. Algemene gezondheid
 # ---------------------------------------------------------------
 echo ">> Services en schijfruimte controleren..."
-FAILED=$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | tr '\n' ' ')
-[ -n "${FAILED// /}" ] && waarschuwing "Mislukte services: $FAILED"
-
-# Snelle check op webshells: .php-bestanden in upload-mappen horen daar niet
-if [ -d /var/www ]; then
-  WS=$(timeout 60 find /var/www -type f -iname '*.php*' -path '*/uploads/*' 2>/dev/null | head -5 | xargs)
-  [ -n "$WS" ] && waarschuwing "PHP-bestanden in upload-map (mogelijk webshell, controleren!): $WS"
-fi
+FAILED=$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | xargs)
+[ -n "$FAILED" ] && waarschuwing "Mislukte services: $FAILED"
 
 ROOTVOL=$(df --output=pcent / | tail -1 | tr -dc '0-9')
 [ "${ROOTVOL:-0}" -ge 90 ] && waarschuwing "Schijf / is ${ROOTVOL}% vol"
+
+if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
+  INFO+=("Docker-containers worden niet bijgewerkt (docker compose pull && docker compose up -d)")
+fi
 
 # ---------------------------------------------------------------
 # 5. Resultaat
@@ -261,76 +155,40 @@ else
   STATUS="JA"; RC=0
 fi
 
-SAMENVATTING=$(
-  echo "Server:  $(hostname) ($(hostname -I 2>/dev/null | awk '{print $1}'))"
-  echo "Tijd:    $(date '+%F %T')"
-  echo
-  for p in ${PROBLEMEN[@]+"${PROBLEMEN[@]}"}; do echo "  [X] $p"; done
-  for w in ${WAARSCHUWINGEN[@]+"${WAARSCHUWINGEN[@]}"}; do echo "  [!] $w"; done
-  for i in ${INFO[@]+"${INFO[@]}"}; do echo "  [i] $i"; done
-  [ "$DOCKER_INFO" -eq 1 ] && echo "  [i] Docker-containers worden niet door dit script bijgewerkt (docker compose pull && docker compose up -d)"
-  echo
-  echo "  Alles OK?  >>>  $STATUS  <<<"
+REGELS=$(
+  for p in ${PROBLEMEN[@]+"${PROBLEMEN[@]}"}; do echo "[X] $p"; done
+  for w in ${WAARSCHUWINGEN[@]+"${WAARSCHUWINGEN[@]}"}; do echo "[!] $w"; done
+  for i in ${INFO[@]+"${INFO[@]}"}; do echo "[i] $i"; done
 )
 
 echo
 echo "================ RESULTAAT ================"
-echo "$SAMENVATTING"
+[ -n "$REGELS" ] && echo "$REGELS" | sed 's/^/  /' && echo
+echo "  Alles OK?  >>>  $STATUS  <<<"
 echo "==========================================="
 echo "Log: $LOG"
 
-stuur_mail
-rm -f "$RUNLOG"
+stuur_push
 exit $RC
 }
 
 # ---------------------------------------------------------------
-# Mail met het resultaat (instellingen in /etc/update-check.conf)
+# Pushover-melding met het resultaat
 # ---------------------------------------------------------------
-stuur_mail() {
-  [ -n "${MAIL_TO:-}" ] || return 0
-  if [ "${MAIL_BIJ:-altijd}" = problemen ] && [ "$RC" -eq 0 ]; then
-    echo "Geen mail: alles OK en MAIL_BIJ=problemen."
-    return 0
-  fi
-
-  local van="${MAIL_FROM:-update-check@$(hostname -f 2>/dev/null || hostname)}"
-  local bericht
-  bericht=$(mktemp)
-  {
-    echo "From: update-check $(hostname) <$van>"
-    echo "To: $MAIL_TO"
-    echo "Subject: [update-check] $(hostname): $STATUS"
-    echo "Date: $(LC_ALL=C date -R)"
-    echo "MIME-Version: 1.0"
-    echo "Content-Type: text/plain; charset=UTF-8"
-    echo "Content-Transfer-Encoding: 8bit"
-    echo
-  } > "$bericht"
-  # Body: voortgangsregels (\r) en kleurcodes eruit, regels max 900 tekens (SMTP-limiet)
-  {
-    echo "$SAMENVATTING"
-    echo
-    echo "------------------ volledige uitvoer ------------------"
-    cat "$RUNLOG"
-  } | tr '\r' '\n' | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' | fold -w 900 >> "$bericht"
-
-  if [ -n "${SMTP_URL:-}" ]; then
-    local opts=(-sS --crlf --noproxy '*' --url "${SMTP_URL%/}/$(hostname -f 2>/dev/null || hostname)" --mail-from "$van" --mail-rcpt "$MAIL_TO" --upload-file "$bericht")
-    [ "${SMTP_TLS:-ja}" = ja ] && opts+=(--ssl-reqd)
-    [ -n "${SMTP_USER:-}" ] && opts+=(--user "$SMTP_USER:${SMTP_PASS:-}")
-    if curl "${opts[@]}"; then
-      echo "Mail verstuurd naar $MAIL_TO"
-    else
-      echo "[!] Mail versturen via $SMTP_URL mislukt"
-    fi
-  elif command -v sendmail >/dev/null; then
-    sendmail -t < "$bericht" && echo "Mail verstuurd naar $MAIL_TO (via sendmail)" \
-      || echo "[!] Mail versturen via sendmail mislukt"
+stuur_push() {
+  [ -n "${PUSHOVER_USER:-}" ] && [ -n "${PUSHOVER_TOKEN:-}" ] || return 0
+  local tekst="${REGELS:-Alles bijgewerkt, geen bijzonderheden.}"
+  if curl -s --max-time 20 \
+       --form-string "token=$PUSHOVER_TOKEN" \
+       --form-string "user=$PUSHOVER_USER" \
+       --form-string "title=$(hostname): $STATUS" \
+       --form-string "message=${tekst:0:1000}" \
+       --form-string "priority=$PUSHOVER_PRIORITY" \
+       https://api.pushover.net/1/messages.json | grep -q '"status":1'; then
+    echo "Pushover-melding verstuurd."
   else
-    echo "[!] Geen SMTP_URL in $CONF en geen sendmail gevonden: mail niet verstuurd"
+    echo "[!] Pushover-melding versturen mislukt (controleer PUSHOVER_USER/PUSHOVER_TOKEN)."
   fi
-  rm -f "$bericht"
 }
 
 main "$@"
