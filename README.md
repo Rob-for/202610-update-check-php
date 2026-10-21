@@ -28,6 +28,26 @@ Zet de sleutels **nooit** in deze publieke repository.
 
 Het script herstart de server **nooit** zelf en werkt Docker-images niet bij. Alles wordt gelogd in `/var/log/update-check.log`.
 
+## Alle servers in één keer (update-alle.sh)
+
+Op een beheer-LXC (Debian/Ubuntu, als root):
+
+1. Zet je servers in `/root/servers.txt` (zie `servers.txt.voorbeeld`).
+2. Eerste keer, met Pushover:
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/Rob-for/202610-update-check-php/main/update-alle.sh | PUSHOVER_USER=<user-key> PUSHOVER_TOKEN=<api-token> bash
+   ```
+3. Daarna:
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/Rob-for/202610-update-check-php/main/update-alle.sh | bash
+   ```
+
+Het script logt via SSH in op elke server, draait daar `update-check.sh` en stuurt **één** Pushover-melding met het overzicht. Volledige logs per server staan in `/var/log/update-alle/`.
+
+Aanrader: rol eenmalig SSH-sleutels uit met `… | bash -s sleutels`. Daarna kunnen wachtwoorden van root-gebruikers uit de lijst.
+
+## Uitkomst
+
 | Melding | Betekenis | Exitcode |
 |---|---|---|
 | `JA` | Alles bijgewerkt en in orde | 0 |

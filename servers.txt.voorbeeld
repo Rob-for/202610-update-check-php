@@ -1,0 +1,12 @@
+# Serverlijst voor update-alle.sh
+# Kopieer naar /root/servers.txt op de beheer-LXC. Het script zet hem zelf op chmod 600.
+# NOOIT de echte lijst in de GitHub-repo zetten.
+#
+# Per regel: host[:poort]  gebruiker  wachtwoord
+#   - wachtwoord leeg laten = inloggen met SSH-sleutel (zie: update-alle.sh sleutels)
+#   - is de gebruiker geen root, dan wordt het wachtwoord ook voor sudo gebruikt
+#   - wachtwoorden zonder spaties
+#
+192.168.1.52       bart     wachtwoord-van-bart
+lamp.thuis.lan     root     wachtwoord-van-root
+192.168.1.60:2222  root
