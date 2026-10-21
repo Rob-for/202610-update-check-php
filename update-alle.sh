@@ -102,8 +102,8 @@ for regel in "${REGELS[@]}"; do
   host=${doel%%:*}; poort=22; [[ $doel == *:* ]] && poort=${doel##*:}
   log="$LOGDIR/${host}_$STAMP.log"
 
-  # Commando op de server: update-check ophalen en draaien; geen eigen push (wij sturen één samenvatting)
-  remote="env GEEN_PUSH=1 bash -o pipefail -c 'curl -fsSL $SCRIPT_URL | bash'"
+  # Commando op de server: update-check ophalen en draaien; push stuurt dit script per server
+  remote="env GEEN_PUSH=1 bash -o pipefail -c '(curl -fsSL $SCRIPT_URL 2>/dev/null || wget -qO- $SCRIPT_URL) | bash'"
   [ "$gebruiker" != root ] && remote="sudo -S -p '' $remote"
 
   echo
@@ -139,7 +139,11 @@ for regel in "${REGELS[@]}"; do
   echo "-------- $host: $status"
   OVERZICHT+=("$host: $status")
   if [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]; then N_JA=$((N_JA+1)); else N_NEE=$((N_NEE+1)); fi
-  while IFS= read -r d; do DETAILS+=("$host $d"); done < <(grep -E '^[[:space:]]+\[(X|!)\]' "$log" | sed -E 's/^[[:space:]]+//')
+
+  # Eén Pushover-melding per server
+  details=$(grep -E '^[[:space:]]+\[(X|!)\]' "$log" | sed -E 's/^[[:space:]]+//')
+  [ -n "$details" ] || details="Alles bijgewerkt, geen bijzonderheden."
+  stuur_push "$host: $status" "$details"
 done
 
 # --- Totaaloverzicht ---
@@ -159,24 +163,29 @@ echo "Logs: $LOGDIR"
 # Logs ouder dan 90 dagen opruimen
 find "$LOGDIR" -name '*.log' -mtime +90 -delete 2>/dev/null
 
-stuur_push
+if [ -z "${PUSHOVER_USER:-}" ] || [ -z "${PUSHOVER_TOKEN:-}" ]; then
+  echo
+  echo "[!] Geen Pushover-sleutels ingesteld, er zijn geen meldingen verstuurd."
+  echo "    Draai één keer met:  curl ... | PUSHOVER_USER=<user-key> PUSHOVER_TOKEN=<api-token> bash"
+fi
 [ "$N_NEE" -eq 0 ]
 }
 
+# Pushover-melding: $1 = titel, $2 = tekst
 stuur_push() {
   [ -n "${PUSHOVER_USER:-}" ] && [ -n "${PUSHOVER_TOKEN:-}" ] || return 0
-  local tekst
-  tekst=$(printf '%s\n' "${OVERZICHT[@]}"; [ ${#DETAILS[@]} -gt 0 ] && { echo; printf '%s\n' "${DETAILS[@]}"; })
-  if curl -s --max-time 20 \
+  local antwoord
+  antwoord=$(curl -sS --max-time 20 \
        --form-string "token=$PUSHOVER_TOKEN" \
        --form-string "user=$PUSHOVER_USER" \
-       --form-string "title=Updates: $N_JA OK, $N_NEE niet OK" \
-       --form-string "message=${tekst:0:1000}" \
+       --form-string "title=$1" \
+       --form-string "message=${2:0:1000}" \
        --form-string "priority=$PUSHOVER_PRIORITY" \
-       https://api.pushover.net/1/messages.json | grep -q '"status":1'; then
-    echo "Pushover-melding verstuurd."
+       https://api.pushover.net/1/messages.json 2>&1)
+  if echo "$antwoord" | grep -q '"status":1'; then
+    echo "   Pushover-melding verstuurd."
   else
-    echo "[!] Pushover-melding versturen mislukt."
+    echo "   [!] Pushover-melding mislukt: $antwoord"
   fi
 }
 

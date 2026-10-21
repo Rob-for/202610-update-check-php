@@ -176,7 +176,7 @@ exit $RC
 # Pushover-melding met het resultaat
 # ---------------------------------------------------------------
 stuur_push() {
-  [ "${GEEN_PUSH:-}" = 1 ] && return 0   # update-alle.sh stuurt zelf één samenvatting
+  [ "${GEEN_PUSH:-}" = 1 ] && return 0   # update-alle.sh stuurt de melding zelf
   [ -n "${PUSHOVER_USER:-}" ] && [ -n "${PUSHOVER_TOKEN:-}" ] || return 0
   local tekst="${REGELS:-Alles bijgewerkt, geen bijzonderheden.}"
   if curl -s --max-time 20 \
